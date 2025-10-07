@@ -1,5 +1,6 @@
 import streamlit as st
 from scraper import scrape_product_page, download_all_colors
+from browser_scraper import scrape_with_browser
 from pathlib import Path
 import zipfile, io, shutil, os
 
@@ -16,6 +17,8 @@ with col1:
     run_btn = st.button("Estrai & Scarica", type="primary")
 with col2:
     skip_hd = st.toggle("Salta tentativi HD (più veloce)", value=False, help="Se attivo, evita heuristics pesanti per trovare la massima risoluzione.")
+
+use_browser = st.toggle("Usa browser headless (accurato)", value=True, help="Clicca ogni swatch come un utente reale e scarica l'immagine principale aggiornata.")
 
 output_zip = None
 
@@ -36,13 +39,25 @@ if run_btn:
     for i, url in enumerate(urls, start=1):
         with st.status(f"Elaboro: {url}", expanded=False) as status:
             try:
-                meta = scrape_product_page(url)
-                status.update(label=f"SKU {meta.get('sku','?')} • {url}", state="running")
-                folder = workdir / meta["sku"]
-                folder.mkdir(parents=True, exist_ok=True)
-                results = download_all_colors(url=url, meta=meta, out_dir=folder, try_hd=not skip_hd)
-                all_results.append((meta, results))
-                status.update(label=f"Completato: {meta['sku']} ({len(results)} immagini)", state="complete")
+                if use_browser:
+                    br = scrape_with_browser(url, workdir)
+                    folder = workdir / br['sku']
+                    folder.mkdir(parents=True, exist_ok=True)
+                    # sposta i file nella cartella SKU
+                    import shutil, os
+                    for f in os.listdir(workdir):
+                        if f.startswith(br['sku'] + ' - '):
+                            shutil.move(str(workdir / f), str(folder / f))
+                    status.update(label=f"Completato: {br['sku']} ({len(br['results'])} immagini)", state="complete")
+                    all_results.append(({ 'sku': br['sku'], 'title': None, 'colors': [] }, br['results']))
+                else:
+                    meta = scrape_product_page(url)
+                    status.update(label=f"SKU {meta.get('sku','?')} • {url}", state="running")
+                    folder = workdir / meta["sku"]
+                    folder.mkdir(parents=True, exist_ok=True)
+                    results = download_all_colors(url=url, meta=meta, out_dir=folder, try_hd=not skip_hd)
+                    all_results.append((meta, results))
+                    status.update(label=f"Completato: {meta['sku']} ({len(results)} immagini)", state="complete")
             except Exception as e:
                 st.warning(f"Errore su {url}: {e}")
         progress.progress(i/len(urls), text=f"{i}/{len(urls)} completati")
