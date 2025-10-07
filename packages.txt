@@ -1,0 +1,15 @@
+libnss3
+libxss1
+libxshmfence1
+libxkbcommon0
+libasound2
+libgbm1
+libgtk-3-0
+libx11-6
+libxcomposite1
+libxrandr2
+libxi6
+libatk-bridge2.0-0
+libxdamage1
+libxfixes3
+libglib2.0-0
