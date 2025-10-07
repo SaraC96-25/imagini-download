@@ -9,31 +9,29 @@ import zipfile, io, shutil, os, subprocess, sys
 
 def ensure_chromium():
     """
-    Verifica se Playwright/Chromium è installato; se non lo è, lo scarica automaticamente.
+    Verifica/installa Chromium per Playwright.
+    Su Streamlit Cloud le dipendenze di sistema arrivano da packages.txt,
+    quindi qui installiamo solo il browser.
     """
-    try:
-        import playwright  # noqa
-    except ImportError:
-        pass
-
     flag = Path(".playwright_chromium_ready")
     if flag.exists():
         return True
-
     try:
-        st.info("⚙️ Installazione di Chromium in corso (può richiedere ~1 minuto)...")
-        subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"],
+        st.info("⚙️ Installo Chromium per Playwright…")
+        proc = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
         )
+        st.caption(proc.stdout[-1000:] if proc.stdout else "chromium install ok")
         flag.touch()
-        st.success("Chromium installato con successo ✅")
+        st.success("Chromium installato ✅")
         return True
     except Exception as e:
-        st.error(f"Installazione di Chromium fallita: {e}")
+        st.error("Installazione di Chromium fallita.")
+        st.code(str(e))
         return False
 
 
