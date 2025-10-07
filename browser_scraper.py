@@ -1,5 +1,5 @@
 from pathlib import Path
-import re, urllib.parse
+import re, urllib.parse, time
 from playwright.sync_api import sync_playwright
 import requests
 
@@ -35,18 +35,16 @@ def enlarge_url_candidates(src_url: str) -> list[str]:
         out.append(src_url.replace(f"opt-{size}", "opt-1600x1600"))
         out.append(src_url.replace(f"opt-{size}", "opt-1200x1200"))
         out.append(src_url.replace(f"opt-{size}", "opt-1000x1000"))
-    seen = set()
-    out2 = []
+    seen = set(); out2 = []
     for u in out:
         if u not in seen:
-            out2.append(u)
-            seen.add(u)
+            out2.append(u); seen.add(u)
     return out2
 
 def try_download(url: str) -> bytes | None:
     try:
         r = requests.get(url, headers=HEADERS, timeout=45, allow_redirects=True)
-        ctype = r.headers.get("Content-Type", "").lower()
+        ctype = r.headers.get("Content-Type","").lower()
         if r.status_code == 200 and "text/html" not in ctype:
             return r.content
     except Exception:
@@ -54,13 +52,6 @@ def try_download(url: str) -> bytes | None:
     return None
 
 def scrape_with_browser(url: str, out_dir: Path):
-    """
-    Usa Playwright per:
-    - leggere SKU da h2.prodCode
-    - cliccare ogni swatch a.js_colorswitch
-    - dopo ogni click, aspettare che cambi la main image (#js_productMainPhoto img)
-    - provare prima il link “Scarica foto in HD”, altrimenti scaricare la main image
-    """
     out_dir.mkdir(parents=True, exist_ok=True)
     results = []
 
@@ -96,18 +87,26 @@ def scrape_with_browser(url: str, out_dir: Path):
 
                 old_src = page.locator("#js_productMainPhoto img").first.get_attribute("src")
                 a.click()
+                # aspetta che l'immagine principale cambi (max 10s)
                 try:
                     page.wait_for_function(
                         "(oldSrc) => { const img=document.querySelector('#js_productMainPhoto img'); return img && img.getAttribute('src')!==oldSrc; }",
-                        arg=old_src, timeout=5000
+                        arg=old_src, timeout=10000
                     )
                 except Exception:
-                    page.wait_for_timeout(500)
+                    page.wait_for_timeout(1000)
 
-            # prova link HD
-            hd_href = page.locator("a.js_downloadPhoto[href*='product_photo_download']").first.get_attribute("href")
-            if hd_href:
-                hd_url = urllib.parse.urljoin(url, hd_href)
+            # tenta link HD ma senza bloccare se non esiste
+            hd_url = None
+            try:
+                hd_href = page.locator("a.js_downloadPhoto[href*='product_photo_download']").first
+                if hd_href:
+                    hd_url = hd_href.get_attribute("href")
+            except Exception:
+                hd_url = None
+
+            if hd_url:
+                hd_url = urllib.parse.urljoin(url, hd_url)
                 data = try_download(hd_url)
                 if data:
                     ext = guess_ext_from_bytes(data)
@@ -117,10 +116,14 @@ def scrape_with_browser(url: str, out_dir: Path):
                     fname = f"{base}{ext}"
                     (out_dir / fname).write_bytes(data)
                     results.append({"method": "hd_link", "file": fname, "url": hd_url})
-                    continue
+                    continue  # passa al prossimo colore
 
-            # altrimenti scarica main image
-            src = page.locator("#js_productMainPhoto img").first.get_attribute("src")
+            # fallback → main image
+            src = None
+            try:
+                src = page.locator("#js_productMainPhoto img").first.get_attribute("src")
+            except Exception:
+                pass
             if src:
                 src_abs = urllib.parse.urljoin(url, src)
                 best, used = None, None
