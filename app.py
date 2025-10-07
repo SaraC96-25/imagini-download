@@ -1,8 +1,51 @@
 import streamlit as st
 from scraper import scrape_product_page, download_all_colors
-from browser_scraper import scrape_with_browser
 from pathlib import Path
 import zipfile, io, shutil, os
+import subprocess, sys, os
+
+def ensure_chromium():
+    """
+    Prova a usare Playwright; se il browser non è installato, esegue:
+    python -m playwright install --with-deps chromium
+    """
+    try:
+        # test rapido: import + create context senza lanciare browser
+        import playwright  # noqa
+    except Exception:
+        pass  # comunque tentiamo l'install
+
+    try:
+        # evita reinstall ripetute
+        flag = Path(".playwright_chromium_ready")
+        if flag.exists():
+            return True
+        # installa chromium e dipendenze
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        flag.touch()
+        return True
+    except Exception as e:
+        import streamlit as st
+        st.error(f"Installazione Chromium fallita: {e}")
+        return False
+
+def get_browser_scraper():
+    """
+    Importa in ritardo la funzione headless. Comodo perché possiamo installare Chromium prima.
+    """
+    try:
+        from browser_scraper import scrape_with_browser
+        return scrape_with_browser
+    except Exception as e:
+        import streamlit as st
+        st.error(f"Impossibile importare browser_scraper: {e}")
+        return None
 
 st.set_page_config(page_title="InnovativeWear Image Scraper", page_icon="🧵", layout="centered")
 
