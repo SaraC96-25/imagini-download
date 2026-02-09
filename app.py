@@ -1,136 +1,193 @@
-import streamlit as st
+import re
 from pathlib import Path
-import zipfile, io, shutil, os, subprocess, sys
-from scraper import scrape_product_page, download_all_colors
+from urllib.parse import urljoin
 
-# ───────────────────────────────────────────────
-# Supporto Playwright
-# ───────────────────────────────────────────────
-def ensure_chromium():
-    flag = Path(".playwright_chromium_ready")
-    if flag.exists():
-        return True
-    try:
-        st.info("⚙️ Installo Chromium per Playwright (può richiedere 1 minuto)...")
-        subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium"],
-            check=True,
-        )
-        flag.touch()
-        st.success("Chromium installato ✅")
-        return True
-    except Exception as e:
-        st.error(f"Installazione fallita: {e}")
-        return False
+from playwright.sync_api import sync_playwright
 
+BASE = "https://www.innovativewear.com"
 
-def get_browser_scraper():
-    try:
-        from browser_scraper import scrape_with_browser
-        return scrape_with_browser
-    except Exception as e:
-        st.error(f"Errore durante l'import di browser_scraper: {e}")
+KEYWORDS = {
+    "Black": ["black", "nero"],
+    "White": ["white", "bianco", "off white", "off-white", "ivory", "natural"],
+    "LightGrey": [
+        "sport grey", "sport gray",
+        "light oxford",
+        "grey heather", "gray heather",
+        "heather grey", "heather gray",
+        "ash",
+        "light grey", "light gray",
+        "silver",
+        "grey", "gray",
+    ],
+    "Red": ["red", "rosso", "cardinal", "crimson", "scarlet", "cherry", "burgundy"],
+    "Navy": ["navy", "dark navy", "midnight", "marine", "deep navy"],
+    "Royal": ["royal", "royal blue", "bright blue", "cobalt"],
+}
+
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", s.strip().lower())
+
+def _clean_color_label(s: str) -> str:
+    s = s.strip()
+    s = s.split("\n")[0].strip()
+    s = re.sub(r"\(\s*[^)]+\s*\)", "", s).strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def _sanitize_filename(s: str) -> str:
+    s = s.strip()
+    s = re.sub(r"\s+", "_", s)
+    s = re.sub(r"[^A-Za-z0-9_\-]+", "", s)
+    return s
+
+def _score(target: str, name: str) -> int:
+    n = _norm(name)
+    score = 0
+    for i, kw in enumerate(KEYWORDS.get(target, [])):
+        if kw in n:
+            score += 1000 - i * 10
+    # penalità “grigi scuri” quando cerchi grigio chiaro
+    if target == "LightGrey" and any(bad in n for bad in ["charcoal", "dark", "graphite", "dark heather"]):
+        score -= 250
+    return score
+
+def _pick_best_for_target(target: str, available_names: list[str]) -> str | None:
+    ranked = sorted((( _score(target, n), n) for n in available_names), reverse=True, key=lambda x: x[0])
+    if not ranked:
         return None
+    best_score, best_name = ranked[0]
+    return best_name if best_score > 0 else None
 
+def _extract_size(url: str) -> tuple[int, int]:
+    m = re.search(r"(\d{2,5})x(\d{2,5})", url)
+    return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
 
-# ───────────────────────────────────────────────
-# Interfaccia utente Streamlit
-# ───────────────────────────────────────────────
-st.set_page_config(page_title="InnovativeWear Image Scraper", page_icon="🧵", layout="centered")
-st.title("🧵 InnovativeWear • Image Scraper")
-
-st.markdown(
-    "Scarica automaticamente le **immagini HD** per ogni variante colore dei prodotti InnovativeWear."
-)
-
-urls_text = st.text_area(
-    "URL del prodotto",
-    value="https://www.innovativewear.com/vendita/cwu02k",
-    height=100,
-)
-
-st.subheader("Credenziali di accesso (necessarie per vedere le immagini complete)")
-user = st.text_input("Email o username", type="default", value="")
-pwd = st.text_input("Password", type="password", value="")
-
-col1, col2, col3 = st.columns([1, 1, 1])
-with col1:
-    run_btn = st.button("🚀 Estrai e scarica", type="primary")
-with col2:
-    skip_hd = st.toggle("Salta HD", value=False)
-with col3:
-    use_browser = st.toggle("Usa browser headless (accurato)", value=True)
-
-# ───────────────────────────────────────────────
-# Logica principale
-# ───────────────────────────────────────────────
-if run_btn:
-    urls = [u.strip() for u in urls_text.splitlines() if u.strip()]
+def _best_img_url(urls: set[str]) -> str | None:
     if not urls:
-        st.error("Inserisci almeno un URL valido.")
-        st.stop()
+        return None
+    def rank(u: str):
+        w, h = _extract_size(u)
+        area = w * h
+        bonus = 1 if "opt-" in u else 0
+        return (area, bonus, len(u))
+    return sorted(urls, key=rank, reverse=True)[0]
 
-    workdir = Path("download_out")
-    if workdir.exists():
-        shutil.rmtree(workdir)
-    workdir.mkdir(parents=True, exist_ok=True)
+def scrape_with_browser(url: str, out_dir: Path, username: str = "", password: str = "",
+                       targets: list[str] | None = None, try_hd: bool = True):
+    """
+    Ritorna:
+    {
+      "sku": "GLSF500",
+      "results": [
+        {"target": "Black", "color": "Black", "file": "download_out/GLSF500_Black.jpg", "img_url": "..."},
+        ...
+      ]
+    }
+    """
+    targets = targets or ["Black", "White", "LightGrey", "Red", "Navy", "Royal"]
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    progress = st.progress(0.0)
-    all_results = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.goto(url, wait_until="domcontentloaded")
+        page.wait_for_timeout(800)
 
-    for i, url in enumerate(urls, start=1):
-        st.write(f"🔎 Elaboro {url} ...")
+        # Se serve login: (qui dipende dal sito; se il tuo vecchio scraper lo fa già, riusa quello)
+        # Se hai già flusso login funzionante, NON duplicarlo: integra qui.
 
-        try:
-            if use_browser:
-                ok = ensure_chromium()
-                if not ok:
-                    st.stop()
+        # SKU
+        sku_el = page.locator("h2.prodCode, .prodCode").first
+        sku = _sanitize_filename(sku_el.inner_text().strip())
 
-                scrape_with_browser = get_browser_scraper()
-                if not scrape_with_browser:
-                    st.stop()
+        # Colori disponibili: titolo del link es. "Black (36)"
+        color_links = page.locator("a.js_colorswitch, a.colorSwitch, a[data-color][data-fid1]")
+        available = []
+        link_map = {}  # name -> nth index
+        for i in range(color_links.count()):
+            a = color_links.nth(i)
+            title = a.get_attribute("title") or ""
+            name = title.split("(")[0].strip() if title else ""
+            name = _clean_color_label(name)
+            if name and name not in link_map:
+                link_map[name] = i
+                available.append(name)
 
-                br = scrape_with_browser(url, workdir, username=user, password=pwd)
+        results = []
 
-                folder = workdir / br["sku"]
-                folder.mkdir(exist_ok=True)
-                for f in os.listdir(workdir):
-                    if f.startswith(br["sku"] + " - "):
-                        shutil.move(str(workdir / f), str(folder / f))
+        for target in targets:
+            chosen = _pick_best_for_target(target, available)
+            if not chosen:
+                results.append({"target": target, "color": None, "file": None, "img_url": None, "note": "No match"})
+                continue
 
-                st.success(f"✅ {br['sku']}: {len(br['results'])} immagini salvate")
-                all_results.append(br)
+            # click colore
+            color_links.nth(link_map[chosen]).click(force=True)
+            page.wait_for_timeout(1200)
 
-            else:
-                meta = scrape_product_page(url)
-                results = download_all_colors(url=url, meta=meta, out_dir=workdir, try_hd=not skip_hd)
-                all_results.append({"sku": meta["sku"], "results": results})
+            # label colore selezionato (per naming reale)
+            label = None
+            for sel in ["p.colorLabel.js_searchable", "p.colorLabel", ".colorLabel"]:
+                loc = page.locator(sel).first
+                if loc.count() > 0:
+                    label = _clean_color_label(loc.inner_text())
+                    break
+            if not label:
+                label = chosen
+            label_safe = _sanitize_filename(label)
 
-        except Exception as e:
-            st.error(f"Errore su {url}: {e}")
+            # trova immagine migliore
+            img_urls = set()
 
-        progress.progress(i / len(urls))
+            main_img = page.locator("#js_productMainPhoto img, .wrapperFoto img, img.callToZoom").first
+            if main_img.count() > 0:
+                # url immagine corrente
+                src = main_img.get_attribute("src")
+                if src:
+                    img_urls.add(urljoin(BASE, src))
 
-    # ───────────────────────────────────────────────
-    # ZIP finale
-    # ───────────────────────────────────────────────
-    mem_zip = io.BytesIO()
-    with zipfile.ZipFile(mem_zip, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for root, _, files in os.walk(workdir):
-            for f in files:
-                full = Path(root) / f
-                zf.write(full, arcname=str(full.relative_to(workdir)))
-    mem_zip.seek(0)
+                if try_hd:
+                    # prova ad aprire zoom
+                    try:
+                        main_img.click(timeout=1500)
+                        page.wait_for_timeout(600)
+                    except:
+                        pass
 
-    st.download_button(
-        "📦 Scarica ZIP delle immagini",
-        data=mem_zip,
-        file_name="innovativewear_images.zip",
-        mime="application/zip",
-    )
+                    # raccogli possibili HD da modal/DOM
+                    for sel in ["#myZoomModal img", ".modal img", "img[src*='opt-']", "a[href*='opt-']"]:
+                        loc = page.locator(sel)
+                        for j in range(loc.count()):
+                            el = loc.nth(j)
+                            for attr in ["src", "href"]:
+                                u = el.get_attribute(attr)
+                                if u and any(ext in u.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"]):
+                                    img_urls.add(urljoin(BASE, u))
 
-    st.subheader("📋 Dettagli estrazione")
-    for br in all_results:
-        st.markdown(f"**SKU:** {br['sku']} ({len(br['results'])} immagini)")
-        st.json(br["results"])
+            best = _best_img_url(img_urls)
+            if not best:
+                results.append({"target": target, "color": label, "file": None, "img_url": None, "note": "No image"})
+                continue
+
+            # estensione
+            ext = ".jpg"
+            mext = re.search(r"\.(jpg|jpeg|png|webp)(?:\?|$)", best, re.IGNORECASE)
+            if mext:
+                ext = "." + mext.group(1).lower().replace("jpeg", "jpg")
+
+            filename = f"{sku}_{label_safe}{ext}"
+            out_path = out_dir / filename
+
+            # download via Playwright request
+            resp = page.request.get(best)
+            if not resp.ok:
+                results.append({"target": target, "color": label, "file": None, "img_url": best, "note": f"HTTP {resp.status}"})
+                continue
+
+            out_path.write_bytes(resp.body())
+
+            results.append({"target": target, "color": label, "file": str(out_path), "img_url": best})
+
+        browser.close()
+        return {"sku": sku, "results": results}
